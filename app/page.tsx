@@ -40,6 +40,8 @@ function clampRating(n: number) {
 export default function Home() {
   const slogan = "Life Without ChatGPT Is Like The Body Without A Soul";
   const team = "Het Patel • Jenil Kukadiya • Krutarth Raychura";
+  const submissionsClosed = true;
+  const pageSize = 500;
 
   const rootRef = useRef<HTMLDivElement | null>(null);
   const heroRef = useRef<HTMLDivElement | null>(null);
@@ -58,6 +60,9 @@ export default function Home() {
   );
   const [starFilter, setStarFilter] = useState<0 | 1 | 2 | 3 | 4 | 5>(0);
   const [soundOn, setSoundOn] = useState(false);
+  const [visibleCount, setVisibleCount] = useState(12);
+  const [isLoadingReviews, setIsLoadingReviews] = useState(false);
+  const [isDatabasePaused, setIsDatabasePaused] = useState(false);
 
   const [reviews, setReviews] = useState<Review[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -93,6 +98,10 @@ export default function Home() {
       return roleOk && starOk;
     });
   }, [reviews, roleFilter, starFilter]);
+
+  useEffect(() => {
+    setVisibleCount(12);
+  }, [roleFilter, starFilter]);
 
   function playStarClick() {
     if (!soundOn) return;
@@ -185,40 +194,73 @@ export default function Home() {
 
     async function load() {
       setError(null);
-      const { data, error } = await sb
-        .from("reviews")
-        .select("id, created_at, name, role, rating, feedback")
-        .order("created_at", { ascending: false })
-        .limit(50);
+      setIsLoadingReviews(true);
+      setIsDatabasePaused(false);
 
-      if (cancelled) return;
-      if (error) {
-        setError(error.message);
-        return;
+      try {
+        const nextAll: Review[] = [];
+        for (let from = 0; !cancelled; from += pageSize) {
+          const { data, error } = await sb
+            .from("reviews")
+            .select("id, created_at, name, role, rating, feedback")
+            .order("created_at", { ascending: false })
+            .range(from, from + pageSize - 1);
+
+          if (cancelled) return;
+          if (error) {
+            if (submissionsClosed) {
+              setIsDatabasePaused(true);
+              setIsLoadingReviews(false);
+              return;
+            }
+
+            setError(error.message);
+            setIsLoadingReviews(false);
+            return;
+          }
+
+          const batch = (data ?? []) as Review[];
+          nextAll.push(...batch);
+          if (batch.length < pageSize) break;
+        }
+
+        if (cancelled) return;
+        setReviews(nextAll);
+        setIsLoadingReviews(false);
+      } catch (e) {
+        if (cancelled) return;
+        if (submissionsClosed) {
+          setIsDatabasePaused(true);
+          setIsLoadingReviews(false);
+          return;
+        }
+        setError(e instanceof Error ? e.message : String(e));
+        setIsLoadingReviews(false);
       }
-      setReviews((data ?? []) as Review[]);
     }
 
     load();
 
-    const channel = sb
-      .channel("reviews-realtime")
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "reviews" },
-        (payload) => {
-          const next = payload.new as Review;
-          setReviews((prev) => {
-            if (prev.some((r) => r.id === next.id)) return prev;
-            return [next, ...prev].slice(0, 50);
-          });
-        }
-      )
-      .subscribe();
+    const channel = submissionsClosed
+      ? null
+      : sb
+          .channel("reviews-realtime")
+          .on(
+            "postgres_changes",
+            { event: "INSERT", schema: "public", table: "reviews" },
+            (payload) => {
+              const next = payload.new as Review;
+              setReviews((prev) => {
+                if (prev.some((r) => r.id === next.id)) return prev;
+                return [next, ...prev];
+              });
+            }
+          )
+          .subscribe();
 
     return () => {
       cancelled = true;
-      void sb.removeChannel(channel);
+      if (channel) void sb.removeChannel(channel);
     };
   }, []);
 
@@ -371,6 +413,13 @@ export default function Home() {
     e.preventDefault();
     setError(null);
 
+    if (submissionsClosed) {
+      toast.message("Submissions closed", {
+        description: "Thanks for participating — the event is now over.",
+      });
+      return;
+    }
+
     if (!isSupabaseConfigured || !supabase) {
       setError(
         "Supabase is not configured. Add NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY to your environment."
@@ -426,7 +475,7 @@ export default function Home() {
       const inserted = data as Review;
       setReviews((prev) => {
         if (prev.some((r) => r.id === inserted.id)) return prev;
-        return [inserted, ...prev].slice(0, 50);
+        return [inserted, ...prev];
       });
 
       toast.success("Thanks! Your feedback was submitted.", {
@@ -468,7 +517,7 @@ export default function Home() {
           <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
             <div className="hero-chip inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-white/70">
               <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-              Live event feedback
+              {submissionsClosed ? "Event archive" : "Live event feedback"}
             </div>
 
             <div className="hero-credit text-xs text-white/55">
@@ -478,7 +527,9 @@ export default function Home() {
 
           <div className="hero-counter mb-4 flex flex-wrap items-center justify-between gap-3">
             <div className="inline-flex items-center gap-2 rounded-2xl border border-white/10 bg-white/5 px-3 py-2 text-sm">
-              <span className="text-white/65">Live counter</span>
+              <span className="text-white/65">
+                {submissionsClosed ? "Final counter" : "Live counter"}
+              </span>
               <span className="h-4 w-px bg-white/10" />
               <span className="font-semibold tabular-nums">{distribution.total}</span>
               <span className="text-white/65">reviews</span>
@@ -490,12 +541,33 @@ export default function Home() {
             <div className="text-xs text-white/50">Team: {team}</div>
           </div>
 
+          {submissionsClosed ? (
+            <div className="mb-8 overflow-hidden rounded-3xl border border-emerald-400/20 bg-gradient-to-br from-emerald-500/15 via-white/5 to-cyan-400/10 p-6 text-emerald-50 shadow-[0_30px_80px_rgba(0,0,0,0.25)] sm:p-8">
+              <div className="text-xs uppercase tracking-[0.25em] text-emerald-100/70">
+                Event completed
+              </div>
+              <div className="mt-2 text-3xl font-semibold leading-tight sm:text-4xl">
+                Thank you for participating.
+              </div>
+              <div className="mt-3 text-sm leading-7 text-emerald-100/80 sm:text-base">
+                Your feedback helped make this slogan event more meaningful. Submissions are now
+                closed, and this page is preserved as an archive for future events.
+              </div>
+              {isDatabasePaused ? (
+                <div className="mt-4 rounded-2xl border border-white/10 bg-black/20 p-4 text-sm text-white/75">
+                  Reviews are temporarily unavailable because the database is paused.
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
           <h1 className="hero-title max-w-full font-semibold tracking-tight whitespace-normal sm:overflow-hidden sm:text-ellipsis sm:whitespace-nowrap [font-size:clamp(1.25rem,2.3vw,2.25rem)]">
             {slogan}
           </h1>
           <p className="hero-sub mt-4 max-w-2xl text-pretty text-base leading-7 text-white/70 sm:text-lg">
-            Give a quick review with a star rating and a short message. The graph updates in
-            real time as students submit feedback.
+            {submissionsClosed
+              ? "Thanks for being part of the event — browse the final results and feedback below."
+              : "Give a quick review with a star rating and a short message. The graph updates in real time as students submit feedback."}
           </p>
 
           <div className="hero-poster mt-8 overflow-hidden rounded-3xl border border-white/10 bg-black/20 shadow-[0_30px_80px_rgba(0,0,0,0.35)]">
@@ -591,7 +663,7 @@ export default function Home() {
           </div>
         ) : null}
 
-        {error ? (
+        {!submissionsClosed && error ? (
           <div className="glass-card mb-10 rounded-2xl border border-rose-500/25 bg-rose-500/10 p-5 text-rose-50">
             <div className="text-sm font-medium">Something went wrong</div>
             <div className="mt-1 text-sm text-rose-100/80">{error}</div>
@@ -689,6 +761,7 @@ export default function Home() {
                   value={name}
                   onChange={(e) => setName(e.target.value)}
                   placeholder="e.g., Krutarth"
+                  disabled={submissionsClosed || isSubmitting}
                   className="w-full rounded-2xl border border-white/10 bg-black/30 px-4 py-3 text-sm text-white placeholder:text-white/35 outline-none transition focus:border-white/20 focus:bg-black/40"
                 />
               </label>
@@ -699,6 +772,7 @@ export default function Home() {
                   <button
                     type="button"
                     onClick={() => setRole("student")}
+                    disabled={submissionsClosed || isSubmitting}
                     className={
                       "rounded-2xl border px-4 py-3 text-sm font-medium transition " +
                       (role === "student"
@@ -711,6 +785,7 @@ export default function Home() {
                   <button
                     type="button"
                     onClick={() => setRole("teacher")}
+                    disabled={submissionsClosed || isSubmitting}
                     className={
                       "rounded-2xl border px-4 py-3 text-sm font-medium transition " +
                       (role === "teacher"
@@ -729,6 +804,7 @@ export default function Home() {
                   <button
                     type="button"
                     onClick={() => setSoundOn((v) => !v)}
+                    disabled={submissionsClosed || isSubmitting}
                     className="rounded-full border border-white/10 bg-black/20 px-3 py-1 text-xs text-white/70 transition hover:border-white/20"
                   >
                     Sound: {soundOn ? "On" : "Off"}
@@ -746,6 +822,7 @@ export default function Home() {
                           playStarClick();
                           setRating(n);
                         }}
+                        disabled={submissionsClosed || isSubmitting}
                         className={
                           "group inline-flex items-center gap-2 rounded-2xl border px-3 py-2 text-sm transition " +
                           (isActive
@@ -771,17 +848,22 @@ export default function Home() {
                   onChange={(e) => setFeedback(e.target.value)}
                   placeholder="Write your thoughts about this slogan..."
                   rows={4}
+                  disabled={submissionsClosed || isSubmitting}
                   className="w-full resize-none rounded-2xl border border-white/10 bg-black/30 px-4 py-3 text-sm text-white placeholder:text-white/35 outline-none transition focus:border-white/20 focus:bg-black/40"
                 />
               </label>
 
               <button
                 type="submit"
-                disabled={isSubmitting}
+                disabled={submissionsClosed || isSubmitting}
                 ref={submitBtnRef}
                 className="inline-flex w-full items-center justify-center rounded-2xl bg-gradient-to-r from-fuchsia-500 to-cyan-400 px-4 py-3 text-sm font-semibold text-black transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
               >
-                {isSubmitting ? "Submitting..." : "Submit feedback"}
+                {submissionsClosed
+                  ? "Submissions closed"
+                  : isSubmitting
+                    ? "Submitting..."
+                    : "Submit feedback"}
               </button>
             </form>
           </div>
@@ -790,7 +872,9 @@ export default function Home() {
             <div className="flex items-center justify-between gap-4">
               <h2 className="text-lg font-semibold">Recent feedback</h2>
               <div className="text-sm text-white/60">
-                Showing {Math.min(50, filteredReviews.length)} of {reviews.length}
+                {isLoadingReviews
+                  ? "Loading..."
+                  : `Showing ${Math.min(visibleCount, filteredReviews.length)} of ${filteredReviews.length} (filtered) • total ${reviews.length}`}
               </div>
             </div>
 
@@ -860,7 +944,7 @@ export default function Home() {
               </div>
             ) : (
               <div className="mt-6 grid grid-cols-1 gap-4 md:grid-cols-2">
-                {filteredReviews.slice(0, 50).map((r) => (
+                {filteredReviews.slice(0, visibleCount).map((r) => (
                   <div
                     key={r.id}
                     className="rounded-2xl border border-white/10 bg-black/20 p-5"
@@ -889,6 +973,18 @@ export default function Home() {
                 ))}
               </div>
             )}
+
+            {filteredReviews.length > visibleCount ? (
+              <div className="mt-6 flex justify-center">
+                <button
+                  type="button"
+                  onClick={() => setVisibleCount((n) => n + 12)}
+                  className="rounded-2xl border border-white/10 bg-black/20 px-5 py-2 text-sm text-white/80 transition hover:border-white/20"
+                >
+                  Load more
+                </button>
+              </div>
+            ) : null}
           </div>
         </section>
 
